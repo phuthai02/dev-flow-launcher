@@ -1,0 +1,10 @@
+{
+  "name": "dev-flow-launcher",
+  "version": "0.1.12",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/background.js && node --check src/shared.js && node --check src/popup/popup.js"
+  }
+}

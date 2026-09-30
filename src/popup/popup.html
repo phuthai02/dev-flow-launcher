@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Dev Flow Launcher</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="popup-header">
+        <div class="brand">
+          <img class="brand-icon" src="../../icons/icon-32.png" alt="" />
+          <div>
+            <h1>Dev Flow</h1>
+            <div class="login-summary" aria-label="Trạng thái đăng nhập">
+              <span><i id="gitlab-dot" class="status-dot warning"></i>GitLab</span>
+              <span><i id="jenkins-dot" class="status-dot warning"></i>Jenkins</span>
+            </div>
+            <p id="last-sync" class="muted login-last-sync">Chưa đồng bộ</p>
+          </div>
+        </div>
+      </header>
+
+      <nav class="tabs" role="tablist" aria-label="Dev Flow">
+        <button class="tab active" data-tab="gitlab" role="tab" aria-selected="true" type="button">GitLab</button>
+        <button class="tab" data-tab="jenkins" role="tab" aria-selected="false" type="button">Jenkins</button>
+        <button class="tab" data-tab="settings" role="tab" aria-selected="false" type="button">Settings</button>
+      </nav>
+
+      <section id="gitlab-panel" class="tab-panel gitlab-panel" role="tabpanel">
+        <div class="gitlab-layout">
+          <section class="card grid merge-create-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Tạo merge request</h2>
+                <p class="muted">Chọn project và hai branch cần merge.</p>
+              </div>
+            </div>
+            <label>Project
+              <div class="search-select">
+                <input id="project" autocomplete="off" placeholder="Đang tải…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="project-options" disabled />
+                <div id="project-options" class="search-options hidden" role="listbox"></div>
+              </div>
+            </label>
+            <div class="grid two">
+              <label>Source branch
+                <div class="search-select">
+                  <input id="source-branch" autocomplete="off" placeholder="Chọn source" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="source-branch-options" disabled />
+                  <div id="source-branch-options" class="search-options hidden" role="listbox"></div>
+                </div>
+              </label>
+              <label>Target branch
+                <div class="search-select">
+                  <input id="target-branch" autocomplete="off" placeholder="Chọn target" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="target-branch-options" disabled />
+                  <div id="target-branch-options" class="search-options hidden" role="listbox"></div>
+                </div>
+              </label>
+            </div>
+            <section id="branch-compare" class="branch-compare hidden" aria-live="polite">
+              <div class="branch-compare-header">
+                <h2>Commits thay đổi</h2>
+                <span id="branch-compare-count" class="branch-compare-count"></span>
+              </div>
+              <div id="branch-compare-list" class="branch-compare-list"></div>
+            </section>
+            <label>Title
+              <input id="mr-title" placeholder="Nội dung merge request" />
+            </label>
+            <label>Description
+              <textarea id="mr-description" placeholder="Mô tả thay đổi (không bắt buộc)"></textarea>
+            </label>
+            <div class="grid two">
+              <label class="check"><input id="squash" type="checkbox" /> Squash commits</label>
+              <label class="check"><input id="remove-source" type="checkbox" /> Xóa source branch</label>
+            </div>
+            <div class="actions end"><button id="create-mr" class="btn" type="button">Tạo merge request</button></div>
+          </section>
+
+          <section class="card merge-request-list-section merge-request-panel" aria-live="polite">
+            <div class="merge-request-list-header">
+              <div>
+                <h2>Merge requests</h2>
+                <p class="muted">Các yêu cầu đang chờ xử lý.</p>
+              </div>
+              <span id="merge-request-count" class="merge-request-count"></span>
+            </div>
+            <div id="merge-request-list" class="merge-request-list">
+              <p class="merge-request-empty">Chọn project để xem merge request.</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="jenkins-panel" class="card grid tab-panel compact-panel hidden" role="tabpanel">
+        <label>Job
+          <div class="search-select">
+            <input id="job" autocomplete="off" placeholder="Đang tải…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="job-options" disabled />
+            <div id="job-options" class="search-options hidden" role="listbox"></div>
+          </div>
+        </label>
+        <div class="actions end"><button id="trigger-build" class="btn" type="button">Build now</button></div>
+        <section id="stage-view" class="stage-view hidden" aria-live="polite">
+          <div class="stage-view-header">
+            <h2>Stage View</h2>
+            <div class="stage-view-actions">
+              <span id="stage-live" class="stage-live hidden"><i></i>Realtime</span>
+            </div>
+          </div>
+          <div id="stage-view-content" class="stage-view-content"></div>
+        </section>
+      </section>
+
+      <section id="settings-panel" class="tab-panel hidden" role="tabpanel">
+        <div class="settings-columns">
+          <section class="card grid settings-card">
+            <div>
+              <h2>GitLab</h2>
+              <p class="muted">Dùng GitLab session và ưu tiên tab cùng host đang mở.</p>
+            </div>
+            <label>Login URL
+              <input id="gitlab-login-url" type="url" placeholder="https://gitlab.example.com/users/sign_in" required />
+            </label>
+            <label>Tài khoản
+              <input id="gitlab-username" autocomplete="username" required />
+            </label>
+            <label>Mật khẩu
+              <input id="gitlab-password" type="password" autocomplete="off" />
+            </label>
+            <p id="gitlab-auth-status" class="auth-status">Chưa đăng nhập.</p>
+            <button id="login-gitlab" class="btn secondary" type="button">Đăng nhập GitLab</button>
+          </section>
+
+          <section class="card grid settings-card">
+            <div>
+              <h2>Jenkins</h2>
+              <p class="muted">Chạy build bằng Jenkins session.</p>
+            </div>
+            <label>Login URL
+              <input id="jenkins-login-url" type="url" placeholder="https://jenkins.example.com/login" required />
+            </label>
+            <label>Tài khoản
+              <input id="jenkins-username" autocomplete="username" required />
+            </label>
+            <label>Mật khẩu
+              <input id="jenkins-password" type="password" autocomplete="off" />
+            </label>
+            <p id="jenkins-auth-status" class="auth-status">Chưa đăng nhập.</p>
+            <button id="login-jenkins" class="btn secondary" type="button">Đăng nhập Jenkins</button>
+          </section>
+        </div>
+
+        <div class="settings-footer">
+          <div class="actions compact">
+            <button id="test-connections" class="btn secondary" type="button">Kiểm tra kết nối</button>
+            <button id="save-settings" class="btn" type="button">Lưu cấu hình</button>
+          </div>
+        </div>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
