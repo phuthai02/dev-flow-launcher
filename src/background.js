@@ -142,24 +142,30 @@ async function handleMessage(message) {
   }
 }
 
-async function getSettings() {
+async function getSettings(service) {
   const storedSettings = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
-  if (!storedSettings) throw new Error("Chưa có cấu hình. Hãy mở Settings trước.");
+  if (!storedSettings) return {};
   const { gitlabToken: _removedToken, ...settings } = storedSettings;
   if (Object.prototype.hasOwnProperty.call(storedSettings, "gitlabToken")) {
     await chrome.storage.local.set({ [STORAGE_KEY]: settings });
   }
 
   const normalized = {
-    gitlabLoginUrl: normalizeBaseUrl(settings.gitlabLoginUrl),
+    gitlabLoginUrl: String(settings.gitlabLoginUrl ?? "").trim(),
     gitlabUsername: String(settings.gitlabUsername ?? "").trim(),
     gitlabPassword: String(settings.gitlabPassword ?? ""),
-    jenkinsLoginUrl: normalizeBaseUrl(settings.jenkinsLoginUrl),
+    jenkinsLoginUrl: String(settings.jenkinsLoginUrl ?? "").trim(),
     jenkinsUsername: String(settings.jenkinsUsername ?? "").trim(),
     jenkinsPassword: String(settings.jenkinsPassword ?? ""),
   };
-  normalized.gitlabUrl = serviceBaseFromLoginUrl(normalized.gitlabLoginUrl, "gitlab");
-  normalized.jenkinsUrl = serviceBaseFromLoginUrl(normalized.jenkinsLoginUrl, "jenkins");
+  if (service === "gitlab") {
+    normalized.gitlabLoginUrl = normalizeBaseUrl(normalized.gitlabLoginUrl);
+    normalized.gitlabUrl = serviceBaseFromLoginUrl(normalized.gitlabLoginUrl, "gitlab");
+  }
+  if (service === "jenkins") {
+    normalized.jenkinsLoginUrl = normalizeBaseUrl(normalized.jenkinsLoginUrl);
+    normalized.jenkinsUrl = serviceBaseFromLoginUrl(normalized.jenkinsLoginUrl, "jenkins");
+  }
   return normalized;
 }
 
@@ -205,7 +211,7 @@ async function removePendingLogin(tabId) {
 }
 
 async function beginLogin(service, passwordInput) {
-  const settings = await getSettings();
+  const settings = await getSettings(service);
   const username = service === "gitlab" ? settings.gitlabUsername : settings.jenkinsUsername;
   const storedPassword = service === "gitlab" ? settings.gitlabPassword : settings.jenkinsPassword;
   const password = String(passwordInput ?? storedPassword);
@@ -274,9 +280,12 @@ async function beginLogin(service, passwordInput) {
 
 async function syncAll(requestedProjectId) {
   const startedAt = Date.now();
+  const settings = await getSettings();
+  const gitlabConfigured = Boolean(settings.gitlabLoginUrl);
+  const jenkinsConfigured = Boolean(settings.jenkinsLoginUrl);
   const [gitlabLogin, jenkinsLogin] = await Promise.allSettled([
-    ensureAuthenticated("gitlab"),
-    ensureAuthenticated("jenkins"),
+    gitlabConfigured ? ensureAuthenticated("gitlab") : null,
+    jenkinsConfigured ? ensureAuthenticated("jenkins") : null,
   ]);
 
   let projects = null;
@@ -284,10 +293,10 @@ async function syncAll(requestedProjectId) {
   let mergeRequests = null;
   let jobs = null;
   let projectId = requestedProjectId;
-  let gitlabError = gitlabLogin.status === "rejected" ? safeMessage(gitlabLogin.reason) : null;
-  let jenkinsError = jenkinsLogin.status === "rejected" ? safeMessage(jenkinsLogin.reason) : null;
+  let gitlabError = gitlabConfigured && gitlabLogin.status === "rejected" ? safeMessage(gitlabLogin.reason) : null;
+  let jenkinsError = jenkinsConfigured && jenkinsLogin.status === "rejected" ? safeMessage(jenkinsLogin.reason) : null;
 
-  if (!gitlabError) {
+  if (gitlabConfigured && !gitlabError) {
     try {
       projects = await gitlabRequest(
         "/api/v4/projects?membership=true&simple=true&per_page=100&order_by=last_activity_at"
@@ -306,7 +315,7 @@ async function syncAll(requestedProjectId) {
     }
   }
 
-  if (!jenkinsError) {
+  if (jenkinsConfigured && !jenkinsError) {
     try {
       jobs = await getJenkinsJobs();
     } catch (error) {
@@ -321,8 +330,8 @@ async function syncAll(requestedProjectId) {
     branches,
     mergeRequests,
     jobs,
-    gitlab: { ok: !gitlabError, error: gitlabError },
-    jenkins: { ok: !jenkinsError, error: jenkinsError },
+    gitlab: { configured: gitlabConfigured, ok: gitlabConfigured ? !gitlabError : null, error: gitlabError },
+    jenkins: { configured: jenkinsConfigured, ok: jenkinsConfigured ? !jenkinsError : null, error: jenkinsError },
   };
   await chrome.storage.local.set({
     [SYNC_KEY]: {
@@ -537,7 +546,13 @@ async function completePendingLogin(tabId, pending, identity) {
 }
 
 async function testConnections() {
-  const results = await Promise.allSettled([getGitlabIdentity(), getJenkinsIdentity()]);
+  const settings = await getSettings();
+  const gitlabConfigured = Boolean(settings.gitlabLoginUrl);
+  const jenkinsConfigured = Boolean(settings.jenkinsLoginUrl);
+  const results = await Promise.allSettled([
+    gitlabConfigured ? getGitlabIdentity() : null,
+    jenkinsConfigured ? getJenkinsIdentity() : null,
+  ]);
   const gitlabIdentity = results[0].status === "fulfilled" ? results[0].value : null;
   const jenkinsIdentity = results[1].status === "fulfilled" ? results[1].value : null;
   const jenkinsAuthenticated = isJenkinsAuthenticated(jenkinsIdentity);
@@ -556,7 +571,7 @@ async function testConnections() {
       username: jenkinsIdentity.name,
       verifiedAt: Date.now(),
     });
-  } else {
+  } else if (jenkinsConfigured) {
     await patchServiceAuth("jenkins", {
       authenticated: false,
       pending: false,
@@ -564,10 +579,14 @@ async function testConnections() {
     });
   }
   return {
-    gitlab: gitlabIdentity
+    gitlab: !gitlabConfigured
+      ? { ok: false, skipped: true }
+      : gitlabIdentity
       ? { ok: true, label: gitlabIdentity.name || gitlabIdentity.username }
       : { ok: false, error: safeMessage(results[0].reason) },
-    jenkins: jenkinsAuthenticated
+    jenkins: !jenkinsConfigured
+      ? { ok: false, skipped: true }
+      : jenkinsAuthenticated
       ? { ok: true, label: jenkinsIdentity.name || "Jenkins" }
       : {
           ok: false,
@@ -577,7 +596,7 @@ async function testConnections() {
 }
 
 async function gitlabSessionRequest(path, options = {}, baseUrlOverride) {
-  const settings = await getSettings();
+  const settings = await getSettings("gitlab");
   const baseUrl = baseUrlOverride ?? settings.gitlabUrl;
   const url = `${baseUrl}${path}`;
   const headers = {
@@ -750,7 +769,7 @@ async function closeMergeRequest(projectId, mergeRequestIid) {
 }
 
 async function jenkinsSessionRequest(path, options = {}, baseUrlOverride) {
-  const settings = baseUrlOverride ? null : await getSettings();
+  const settings = baseUrlOverride ? null : await getSettings("jenkins");
   const baseUrl = baseUrlOverride ?? settings.jenkinsUrl;
   return serviceSessionRequest("jenkins", `${baseUrl}${path}`, {
     ...options,
@@ -779,7 +798,7 @@ async function getJenkinsJobs() {
 
 async function getJenkinsStageView(jobUrl) {
   await requireJenkinsAuth();
-  const settings = await getSettings();
+  const settings = await getSettings("jenkins");
   const trustedJobUrl = assertSameOrigin(jobUrl, settings.jenkinsUrl).replace(/\/+$/, "");
   const runs = await serviceSessionRequest(
     "jenkins",
@@ -802,7 +821,7 @@ async function getJenkinsCrumb() {
 async function triggerBuild(jobUrl, parametersText) {
   return runActionOnce(`build:${jobUrl}`, 3_000, "Build này vừa được đưa vào queue. Hãy chờ Jenkins xử lý.", async () => {
     await requireJenkinsAuth();
-    const settings = await getSettings();
+    const settings = await getSettings("jenkins");
     const trustedJobUrl = assertSameOrigin(jobUrl, settings.jenkinsUrl).replace(/\/+$/, "");
     const parameters = parseBuildParameters(parametersText);
     const hasParameters = [...parameters.keys()].length > 0;

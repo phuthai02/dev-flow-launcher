@@ -42,6 +42,7 @@ let stageViewDom = null;
 let trackedBuild = null;
 let autoSyncInProgress = false;
 let lastPersistedUiState = {};
+let settingsWritePromise = Promise.resolve();
 const activeLoginServices = new Set();
 const searchSelectData = new Map();
 const persistedControlIds = [
@@ -49,6 +50,8 @@ const persistedControlIds = [
   "mr-description",
   "squash",
   "remove-source",
+];
+const settingControlIds = [
   "gitlab-login-url",
   "gitlab-username",
   "gitlab-password",
@@ -94,10 +97,15 @@ mergeRequestList.addEventListener("click", handleMergeRequestAction);
 persistedControlIds.forEach((id) => {
   document.querySelector(`#${id}`).addEventListener("input", persistUiState);
 });
-window.addEventListener("pagehide", persistUiState);
+settingControlIds.forEach((id) => {
+  document.querySelector(`#${id}`).addEventListener("input", persistSettings);
+});
+window.addEventListener("pagehide", () => {
+  persistUiState();
+  persistSettings();
+});
 document.querySelector("#create-mr").addEventListener("click", createMergeRequest);
 document.querySelector("#trigger-build").addEventListener("click", triggerBuild);
-document.querySelector("#save-settings").addEventListener("click", saveSettingsFromUi);
 document.querySelector("#test-connections").addEventListener("click", testConnections);
 document.querySelector("#login-gitlab").addEventListener("click", () => login("gitlab"));
 document.querySelector("#login-jenkins").addEventListener("click", () => login("jenkins"));
@@ -128,12 +136,12 @@ async function init() {
   restoreUiState(uiState);
   await Promise.all([refreshAuthStatus(), refreshLastSync()]);
 
-  if (!settings?.gitlabLoginUrl || !settings?.jenkinsLoginUrl) {
+  if (!settings?.gitlabLoginUrl && !settings?.jenkinsLoginUrl) {
     activateTab("settings");
-    showStatus("Hãy nhập tài khoản và lưu cấu hình trước.", "error");
-    return;
+    showStatus("Hãy cấu hình GitLab hoặc Jenkins để bắt đầu.");
+  } else {
+    activateTab(uiState?.activeTab || "gitlab");
   }
-  activateTab(uiState?.activeTab || "gitlab");
   startAutomaticSync(uiState);
 }
 
@@ -674,20 +682,10 @@ function persistUiState() {
   void chrome.storage.local.set({ [UI_STATE_KEY]: uiState });
 }
 
-async function saveSettingsFromUi() {
-  await runBusy(document.querySelector("#save-settings"), async () => {
-    await saveSettings();
-    showStatus("Đã lưu cấu hình và thông tin đăng nhập trong Chrome profile.", "success");
-    runAutomaticSync();
-  });
-}
-
 async function login(service) {
   const button = document.querySelector(`#login-${service}`);
   await runBusy(button, async () => {
-    await saveSettings();
-    const password = value(`${service}-password`);
-    if (!password) throw new Error(`Hãy nhập mật khẩu ${service === "gitlab" ? "GitLab" : "Jenkins"}.`);
+    await saveServiceSettings(service);
     activeLoginServices.add(service);
     try {
       await sendMessage({
@@ -791,37 +789,67 @@ function applySyncResult(result, selection = {}) {
 
 async function testConnections() {
   await runBusy(document.querySelector("#test-connections"), async () => {
-    await saveSettings();
+    await persistSettings();
     const response = await sendMessage({ type: "TEST_CONNECTIONS" });
-    const gitlab = response.gitlab.ok ? `GitLab: OK (${response.gitlab.label})` : `GitLab: ${response.gitlab.error}`;
-    const jenkins = response.jenkins.ok ? `Jenkins: OK (${response.jenkins.label})` : `Jenkins: ${response.jenkins.error}`;
-    showStatus(`${gitlab}\n${jenkins}`, response.gitlab.ok && response.jenkins.ok ? "success" : "error");
+    const serviceResult = (label, result) => result.skipped
+      ? `${label}: Chưa cấu hình`
+      : result.ok ? `${label}: OK (${result.label})` : `${label}: ${result.error}`;
+    const gitlab = serviceResult("GitLab", response.gitlab);
+    const jenkins = serviceResult("Jenkins", response.jenkins);
+    const tested = [response.gitlab, response.jenkins].filter((result) => !result.skipped);
+    showStatus(`${gitlab}\n${jenkins}`, tested.length && tested.every((result) => result.ok) ? "success" : "error");
   });
 }
 
-async function saveSettings() {
-  const settings = readSettings();
-  const previous = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
-  const granted = await chrome.permissions.request({ origins: settingsOrigins(settings) });
-  if (!granted) throw new Error("Chrome chưa cấp quyền truy cập GitLab/Jenkins host.");
-  await clearAuthForChangedHosts(previous, settings);
-  await chrome.storage.local.set({ [STORAGE_KEY]: settings });
-  await removeStaleHostPermissions(previous, settings);
+function persistSettings() {
+  return enqueueSettingsWrite(readSettingsFromUi());
 }
 
-function readSettings() {
-  const gitlabLoginUrl = normalizeBaseUrl(value("gitlab-login-url"));
-  const jenkinsLoginUrl = normalizeBaseUrl(value("jenkins-login-url"));
-  serviceBaseFromLoginUrl(gitlabLoginUrl, "gitlab");
-  serviceBaseFromLoginUrl(jenkinsLoginUrl, "jenkins");
+async function saveServiceSettings(service) {
+  await persistSettings();
+  const settings = readSettingsFromUi();
+  const label = service === "gitlab" ? "GitLab" : "Jenkins";
+  const loginUrlKey = `${service}LoginUrl`;
+  const usernameKey = `${service}Username`;
+  const passwordKey = `${service}Password`;
+  settings[loginUrlKey] = normalizeBaseUrl(settings[loginUrlKey]);
+  serviceBaseFromLoginUrl(settings[loginUrlKey], service);
+  settings[usernameKey] = settings[usernameKey].trim();
+  if (!settings[usernameKey]) throw new Error(`Thiếu tài khoản ${label}.`);
+  if (!settings[passwordKey] || settings[passwordKey].length > 1024) throw new Error(`Mật khẩu ${label} không hợp lệ.`);
+  const granted = await chrome.permissions.request({ origins: [permissionPattern(settings[loginUrlKey])] });
+  if (!granted) throw new Error(`Chrome chưa cấp quyền truy cập ${label} host.`);
+  setValue(`${service}-login-url`, settings[loginUrlKey]);
+  setValue(`${service}-username`, settings[usernameKey]);
+  await enqueueSettingsWrite(settings);
+}
+
+function readSettingsFromUi() {
   return {
-    gitlabLoginUrl,
+    gitlabLoginUrl: value("gitlab-login-url"),
     gitlabUsername: value("gitlab-username").trim(),
     gitlabPassword: value("gitlab-password"),
-    jenkinsLoginUrl,
+    jenkinsLoginUrl: value("jenkins-login-url"),
     jenkinsUsername: value("jenkins-username").trim(),
     jenkinsPassword: value("jenkins-password"),
   };
+}
+
+function enqueueSettingsWrite(settings) {
+  settingsWritePromise = settingsWritePromise.then(() => storeSettings(settings));
+  return settingsWritePromise;
+}
+
+async function storeSettings(settings) {
+  const stored = await chrome.storage.local.get([STORAGE_KEY, AUTH_KEY]);
+  const previous = stored[STORAGE_KEY] ?? {};
+  const auth = { ...(stored[AUTH_KEY] ?? {}) };
+  for (const service of ["gitlab", "jenkins"]) {
+    const key = `${service}LoginUrl`;
+    if (previous[key] !== settings[key]) auth[service] = null;
+  }
+  await chrome.storage.local.set({ [STORAGE_KEY]: settings, [AUTH_KEY]: auth });
+  await removeChangedHostPermissions(previous, settings);
 }
 
 async function refreshAuthStatus() {
@@ -859,27 +887,16 @@ async function refreshLastSync() {
     : "Chưa đồng bộ";
 }
 
-async function clearAuthForChangedHosts(previous, current) {
-  if (!previous) return;
-  const auth = (await chrome.storage.local.get(AUTH_KEY))[AUTH_KEY] ?? {};
-  const next = { ...auth };
-  if (previous.gitlabLoginUrl !== current.gitlabLoginUrl) next.gitlab = null;
-  if (previous.jenkinsLoginUrl !== current.jenkinsLoginUrl) next.jenkins = null;
-  await chrome.storage.local.set({ [AUTH_KEY]: next });
-}
-
-async function removeStaleHostPermissions(previous, current) {
-  if (!previous?.gitlabLoginUrl || !previous?.jenkinsLoginUrl) return;
-  const currentOrigins = new Set(settingsOrigins(current));
-  const staleOrigins = settingsOrigins(previous).filter((origin) => !currentOrigins.has(origin));
-  if (staleOrigins.length) await chrome.permissions.remove({ origins: staleOrigins });
-}
-
-function settingsOrigins(settings) {
-  return [...new Set([
-    permissionPattern(settings.gitlabLoginUrl),
-    permissionPattern(settings.jenkinsLoginUrl),
-  ])];
+async function removeChangedHostPermissions(previous, current) {
+  for (const service of ["gitlab", "jenkins"]) {
+    const key = `${service}LoginUrl`;
+    if (!previous[key] || previous[key] === current[key]) continue;
+    try {
+      await chrome.permissions.remove({ origins: [permissionPattern(previous[key])] });
+    } catch {
+      // A partially entered previous URL never received a host permission.
+    }
+  }
 }
 
 function setSearchLoading(input, placeholder) {
