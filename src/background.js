@@ -292,6 +292,9 @@ async function syncAll(requestedProjectId) {
       projects = await gitlabRequest(
         "/api/v4/projects?membership=true&simple=true&per_page=100&order_by=last_activity_at"
       );
+      if (projectId && !projects.some((project) => String(project.id) === String(projectId))) {
+        projectId = null;
+      }
       if (projectId) {
         [branches, mergeRequests] = await Promise.all([
           gitlabRequest(`/api/v4/projects/${encodeProjectId(projectId)}/repository/branches?per_page=100`),

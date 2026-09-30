@@ -1,6 +1,7 @@
 export const STORAGE_KEY = "devFlowSettings";
 export const AUTH_KEY = "devFlowAuth";
 export const SYNC_KEY = "devFlowLastSync";
+export const UI_STATE_KEY = "devFlowUiState";
 
 export function normalizeBaseUrl(value) {
   const raw = String(value ?? "").trim();

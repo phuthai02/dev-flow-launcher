@@ -2,6 +2,7 @@ import {
   AUTH_KEY,
   STORAGE_KEY,
   SYNC_KEY,
+  UI_STATE_KEY,
   normalizeBaseUrl,
   permissionPattern,
   safeMessage,
@@ -40,11 +41,27 @@ let latestStageJobUrl = "";
 let stageViewDom = null;
 let trackedBuild = null;
 let autoSyncInProgress = false;
+let lastPersistedUiState = {};
 const activeLoginServices = new Set();
 const searchSelectData = new Map();
+const persistedControlIds = [
+  "mr-title",
+  "mr-description",
+  "squash",
+  "remove-source",
+  "gitlab-login-url",
+  "gitlab-username",
+  "gitlab-password",
+  "jenkins-login-url",
+  "jenkins-username",
+  "jenkins-password",
+];
 
 document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => activateTab(button.dataset.tab));
+  button.addEventListener("click", () => {
+    activateTab(button.dataset.tab);
+    persistUiState();
+  });
 });
 const SEARCH_SELECT_CHANGE_EVENT = "search-select-change";
 
@@ -70,6 +87,14 @@ mergeRequestTitle.addEventListener("input", () => {
 });
 mergeRequestList.addEventListener("click", handleMergeRequestAction);
 [projectSelect, sourceSelect, targetSelect, jobSelect].forEach(setupSearchSelect);
+[projectSelect, sourceSelect, targetSelect, jobSelect].forEach((input) => {
+  input.addEventListener("input", persistUiState);
+  input.addEventListener(SEARCH_SELECT_CHANGE_EVENT, persistUiState);
+});
+persistedControlIds.forEach((id) => {
+  document.querySelector(`#${id}`).addEventListener("input", persistUiState);
+});
+window.addEventListener("pagehide", persistUiState);
 document.querySelector("#create-mr").addEventListener("click", createMergeRequest);
 document.querySelector("#trigger-build").addEventListener("click", triggerBuild);
 document.querySelector("#save-settings").addEventListener("click", saveSettingsFromUi);
@@ -96,8 +121,11 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 init();
 
 async function init() {
-  const settings = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
+  const stored = await chrome.storage.local.get([STORAGE_KEY, UI_STATE_KEY]);
+  const settings = stored[STORAGE_KEY];
+  const uiState = stored[UI_STATE_KEY];
   populateSettings(settings);
+  restoreUiState(uiState);
   await Promise.all([refreshAuthStatus(), refreshLastSync()]);
 
   if (!settings?.gitlabLoginUrl || !settings?.jenkinsLoginUrl) {
@@ -105,8 +133,8 @@ async function init() {
     showStatus("Hãy nhập tài khoản và lưu cấu hình trước.", "error");
     return;
   }
-  activateTab("gitlab");
-  startAutomaticSync();
+  activateTab(uiState?.activeTab || "gitlab");
+  startAutomaticSync(uiState);
 }
 
 function activateTab(name) {
@@ -604,6 +632,48 @@ function populateSettings(settings) {
   setValue("jenkins-password", settings?.jenkinsPassword);
 }
 
+function restoreUiState(uiState) {
+  if (!uiState) return;
+  lastPersistedUiState = uiState;
+  projectSelect.value = uiState.projectValue ?? "";
+  sourceSelect.value = uiState.sourceBranch ?? "";
+  targetSelect.value = uiState.targetBranch ?? "";
+  jobSelect.value = uiState.jobValue ?? "";
+  lastAutomaticMergeRequestTitle = uiState.automaticMergeRequestTitle ?? "";
+
+  for (const id of persistedControlIds) {
+    if (!Object.prototype.hasOwnProperty.call(uiState.controls ?? {}, id)) continue;
+    const control = document.querySelector(`#${id}`);
+    if (control.type === "checkbox") control.checked = Boolean(uiState.controls[id]);
+    else control.value = uiState.controls[id] ?? "";
+  }
+}
+
+function persistUiState() {
+  const project = findListedValue(projectSelect.value, projects, (item) => item.path_with_namespace);
+  const job = findListedValue(jobSelect.value, jobs, (item) => item.path);
+  const controls = {};
+  for (const id of persistedControlIds) {
+    const control = document.querySelector(`#${id}`);
+    controls[id] = control.type === "checkbox" ? control.checked : control.value;
+  }
+  const uiState = {
+    activeTab: document.querySelector(".tab.active")?.dataset.tab ?? "gitlab",
+    projectId: project?.id ?? (
+      projectSelect.value === lastPersistedUiState.projectValue ? lastPersistedUiState.projectId : null
+    ),
+    projectValue: projectSelect.value,
+    sourceBranch: sourceSelect.value,
+    targetBranch: targetSelect.value,
+    jobUrl: job?.url ?? (jobSelect.value === lastPersistedUiState.jobValue ? lastPersistedUiState.jobUrl : null),
+    jobValue: jobSelect.value,
+    automaticMergeRequestTitle: lastAutomaticMergeRequestTitle,
+    controls,
+  };
+  lastPersistedUiState = uiState;
+  void chrome.storage.local.set({ [UI_STATE_KEY]: uiState });
+}
+
 async function saveSettingsFromUi() {
   await runBusy(document.querySelector("#save-settings"), async () => {
     await saveSettings();
@@ -647,22 +717,25 @@ function handleAuthenticationChange(auth) {
   }
 }
 
-function startAutomaticSync() {
-  runAutomaticSync();
+function startAutomaticSync(initialUiState) {
+  runAutomaticSync(initialUiState);
   setInterval(runAutomaticSync, 30_000);
 }
 
-async function runAutomaticSync() {
+async function runAutomaticSync(initialUiState = {}) {
   if (autoSyncInProgress) return;
   if ([projectSelect, sourceSelect, targetSelect, jobSelect].includes(document.activeElement)) return;
   autoSyncInProgress = true;
   document.querySelector("#gitlab-dot").className = "status-dot syncing";
   document.querySelector("#jenkins-dot").className = "status-dot syncing";
   const selection = {
-    projectId: findListedValue(projectSelect.value, projects, (item) => item.path_with_namespace)?.id,
+    projectId: findListedValue(projectSelect.value, projects, (item) => item.path_with_namespace)?.id
+      ?? initialUiState.projectId,
+    projectValue: projectSelect.value,
     sourceBranch: sourceSelect.value,
     targetBranch: targetSelect.value,
-    jobUrl: findListedValue(jobSelect.value, jobs, (item) => item.path)?.url,
+    jobUrl: findListedValue(jobSelect.value, jobs, (item) => item.path)?.url ?? initialUiState.jobUrl,
+    jobValue: jobSelect.value,
   };
   try {
     const result = await sendMessage({
@@ -686,13 +759,19 @@ function applySyncResult(result, selection = {}) {
     const selectedProjectId = selection.projectId ?? result.projectId;
     const project = projects.find((item) => String(item.id) === String(selectedProjectId));
     if (project) projectSelect.value = project.path_with_namespace;
+    else if (selection.projectValue) {
+      clearBranches();
+      clearMergeRequests();
+    }
   }
   if (result.jobs) {
     jobs = result.jobs;
     fillSearchOptions(jobSelect, jobOptions, jobs, (item) => item.path, "Chọn job");
     const selectedJob = jobs.find((item) => item.url === selection.jobUrl);
-    if (selectedJob) jobSelect.value = selectedJob.path;
-    else if (selection.jobUrl) hideStageView();
+    if (selectedJob) {
+      jobSelect.value = selectedJob.path;
+      if (stagePollJobUrl !== selectedJob.url) startStagePolling(selectedJob);
+    } else if (selection.jobUrl) hideStageView();
   }
   if (Array.isArray(result.branches) && result.projectId) {
     branches = result.branches;
@@ -707,6 +786,7 @@ function applySyncResult(result, selection = {}) {
     mergeRequests = result.mergeRequests;
     renderMergeRequests(mergeRequests);
   }
+  persistUiState();
 }
 
 async function testConnections() {
