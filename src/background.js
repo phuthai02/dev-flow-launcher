@@ -24,8 +24,6 @@ const mergeRequestCommitCache = new Map();
 const AUTOMATIC_LOGIN_COOLDOWN_MS = 120_000;
 const MERGE_STATUS_POLL_MS = 1_500;
 const MERGE_STATUS_TIMEOUT_MS = 30_000;
-const SERVICE_SCRIPT_TIMEOUT_MS = 20_000;
-const loginTabQueues = new Map();
 
 chrome.runtime.onInstalled.addListener(restrictStorageAccess);
 chrome.runtime.onStartup.addListener(restrictStorageAccess);
@@ -44,30 +42,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  // Background tabs may never reach "complete"; react on URL commit and let executeScript wait for the DOM.
-  if (changeInfo.status !== "complete" && !changeInfo.url) return;
-  const next = (loginTabQueues.get(tabId) ?? Promise.resolve())
-    .then(() => handleLoginTabUpdate(tabId))
-    .catch(() => {});
-  loginTabQueues.set(tabId, next);
-  next.finally(() => {
-    if (loginTabQueues.get(tabId) === next) loginTabQueues.delete(tabId);
-  });
-});
-
-async function handleLoginTabUpdate(tabId) {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
   const pending = await getPendingLogin(tabId);
-  if (!pending) return;
-  const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || new URL(tab.url).origin !== new URL(pending.loginUrl).origin) return;
+  if (!pending || !tab.url || new URL(tab.url).origin !== new URL(pending.loginUrl).origin) return;
 
   if (pending.phase === "ready") {
     await submitLoginForm(tabId, pending);
     return;
   }
   if (pending.phase === "submitted") await verifyPendingLogin(tabId, pending);
-}
+});
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   const pending = await getPendingLogin(tabId);
@@ -223,7 +208,7 @@ async function beginLogin(service, passwordInput) {
     tab = matches.find((candidate) => candidate.id && candidate.url && new URL(candidate.url).origin === origin) ?? null;
   }
   if (!tab) {
-    tab = await createServiceTab("about:blank");
+    tab = await chrome.tabs.create({ url: "about:blank", active: false });
     managedTab = true;
   }
   if (tab.url && new URL(tab.url).origin === new URL(baseUrl).origin) {
@@ -869,72 +854,38 @@ async function resolveServiceTabInternal(service, url) {
   const origin = new URL(url).origin;
   const auth = (await chrome.storage.local.get(AUTH_KEY))[AUTH_KEY] ?? {};
   const rememberedTabId = auth[service]?.tabId;
-  let rememberedTab = null;
   if (rememberedTabId) {
     try {
-      rememberedTab = await chrome.tabs.get(rememberedTabId);
+      const tab = await chrome.tabs.get(rememberedTabId);
+      if (tab.url && new URL(tab.url).origin === origin) return rememberedTabId;
     } catch {
       // The remembered login tab was closed.
     }
   }
 
   const matches = await chrome.tabs.query({ url: `${origin}/*` });
-  const existing = [rememberedTab, ...matches]
-    .filter((tab) => tab?.id && tab.url && new URL(tab.url).origin === origin)
-    .reduce((best, tab) => (!best || serviceTabRank(tab) < serviceTabRank(best) ? tab : best), null);
-  if (existing) {
-    if (existing.discarded) {
-      await chrome.tabs.reload(existing.id);
-      await waitForTabOrigin(existing.id, origin);
-    }
-    if (existing.id !== rememberedTabId) await patchServiceAuth(service, { tabId: existing.id, managedTab: false });
+  const existing = matches.find((tab) => tab.id && tab.url && new URL(tab.url).origin === origin);
+  if (existing?.id) {
+    await patchServiceAuth(service, { tabId: existing.id, managedTab: false });
     return existing.id;
   }
 
-  const tab = await createServiceTab(origin);
-  await waitForTabOrigin(tab.id, origin);
+  const tab = await chrome.tabs.create({ url: origin, active: false });
+  await waitForTabComplete(tab.id);
   await patchServiceAuth(service, { tabId: tab.id, managedTab: true });
   return tab.id;
 }
 
-// Prefer tabs that can run scripts right away; discarded or frozen tabs are the last resort.
-function serviceTabRank(tab) {
-  if (tab.discarded || tab.frozen) return 3;
-  if (tab.status === "complete") return 0;
-  return tab.active ? 1 : 2;
-}
-
-async function createServiceTab(url) {
-  const tab = await chrome.tabs.create({ url, active: false });
-  try {
-    await chrome.tabs.update(tab.id, { autoDiscardable: false });
-  } catch {
-    // Older Chrome versions keep the default discard policy.
-  }
-  return tab;
-}
-
-function withTimeout(promise, timeoutMs, message) {
-  let timeout;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-    }),
-  ]).finally(() => clearTimeout(timeout));
-}
-
-// executeScript waits for the DOM itself, so only wait for the navigation to commit, not for "complete".
-async function waitForTabOrigin(tabId, origin) {
-  const isCommitted = (tab) => !tab.discarded && Boolean(tab.url) && new URL(tab.url).origin === origin;
-  if (isCommitted(await chrome.tabs.get(tabId))) return;
+async function waitForTabComplete(tabId) {
+  const current = await chrome.tabs.get(tabId);
+  if (current.status === "complete") return;
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("Hết thời gian chờ tab hệ thống mở trang."));
+      reject(new Error("Hết thời gian chờ tab hệ thống tải xong."));
     }, 15_000);
-    const listener = (updatedTabId, _changeInfo, tab) => {
-      if (updatedTabId !== tabId || !isCommitted(tab)) return;
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
       clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
       resolve();
@@ -944,24 +895,19 @@ async function waitForTabOrigin(tabId, origin) {
 }
 
 async function requestInServiceTab(service, tabId, url, options = {}, returnMetadata = false) {
-  const label = service === "gitlab" ? "GitLab" : "Jenkins";
   const tab = await chrome.tabs.get(tabId);
   if (!tab.url || new URL(tab.url).origin !== new URL(url).origin) {
-    throw new Error(`Tab ${label} không cùng host với API.`);
+    throw new Error(`Tab ${service === "gitlab" ? "GitLab" : "Jenkins"} không cùng host với API.`);
   }
-  const results = await withTimeout(
-    chrome.scripting.executeScript({
-      target: { tabId },
-      func: performSameOriginRequest,
-      args: [service, url, options],
-    }),
-    SERVICE_SCRIPT_TIMEOUT_MS,
-    `Tab ${label} không phản hồi (Chrome có thể đang tạm dừng tab chạy nền). Hãy thử lại.`
-  );
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: performSameOriginRequest,
+    args: [service, url, options],
+  });
   const response = results[0]?.result;
   if (!response) throw new Error("Không nhận được kết quả API từ tab hệ thống.");
   if (response.networkError) throw new Error(response.networkError);
-  const data = parseInjectedResponse(response, label);
+  const data = parseInjectedResponse(response, service === "gitlab" ? "GitLab" : "Jenkins");
   return returnMetadata ? { data, location: response.location } : data;
 }
 
