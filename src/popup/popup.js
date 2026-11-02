@@ -394,7 +394,7 @@ async function handleMergeRequestAction(event) {
   if (!mergeRequest) return;
 
   if (button.dataset.action === "view") {
-    await chrome.tabs.create({ url: mergeRequest.web_url });
+    await openServiceUrl(mergeRequest.web_url);
     return;
   }
 
@@ -704,10 +704,24 @@ async function openJenkins() {
       )
       : null;
     const url = job?.url ?? serviceBaseFromLoginUrl(normalizeBaseUrl(value("jenkins-login-url")), "jenkins");
-    await chrome.tabs.create({ url });
+    await openServiceUrl(url);
   } catch (error) {
     showStatus(safeMessage(error), "error");
   }
+}
+
+async function openServiceUrl(url) {
+  const origin = new URL(url).origin;
+  const tabs = (await chrome.tabs.query({ url: `${origin}/*` }))
+    .filter((item) => item.url && new URL(item.url).origin === origin);
+  const tab = tabs.find((item) => item.url === url)
+    ?? tabs.sort((left, right) => (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0];
+  if (!tab) {
+    await chrome.tabs.create({ url });
+    return;
+  }
+  await chrome.tabs.update(tab.id, tab.url === url ? { active: true } : { url, active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
 }
 
 function populateSettings(settings) {

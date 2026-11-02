@@ -24,7 +24,6 @@ const mergeRequestCommitCache = new Map();
 const AUTOMATIC_LOGIN_COOLDOWN_MS = 120_000;
 const MERGE_STATUS_POLL_MS = 1_500;
 const MERGE_STATUS_TIMEOUT_MS = 30_000;
-const SERVICE_TAB_IDLE_PATH = "/robots.txt";
 const SERVICE_SCRIPT_TIMEOUT_MS = 20_000;
 const loginTabQueues = new Map();
 
@@ -527,14 +526,6 @@ async function completePendingLogin(tabId, pending, identity) {
     verifiedAt: Date.now(),
   });
   await removePendingLogin(tabId);
-  if (pending.managedTab) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (!tab.active) await chrome.tabs.update(tabId, { url: serviceTabIdleUrl(pending.baseUrl) });
-    } catch {
-      // The login tab may already be closed.
-    }
-  }
 }
 
 async function testConnections() {
@@ -878,44 +869,39 @@ async function resolveServiceTabInternal(service, url) {
   const origin = new URL(url).origin;
   const auth = (await chrome.storage.local.get(AUTH_KEY))[AUTH_KEY] ?? {};
   const rememberedTabId = auth[service]?.tabId;
+  let rememberedTab = null;
   if (rememberedTabId) {
     try {
-      const tab = await chrome.tabs.get(rememberedTabId);
-      const sameOrigin = Boolean(tab.url) && new URL(tab.url).origin === origin;
-      if (isReadyServiceTab(tab, origin) || (sameOrigin && tab.active)) return rememberedTabId;
-      if (sameOrigin && auth[service]?.managedTab) {
-        await chrome.tabs.update(rememberedTabId, { url: serviceTabIdleUrl(origin) });
-        await waitForTabComplete(rememberedTabId);
-        return rememberedTabId;
-      }
+      rememberedTab = await chrome.tabs.get(rememberedTabId);
     } catch {
       // The remembered login tab was closed.
     }
   }
 
   const matches = await chrome.tabs.query({ url: `${origin}/*` });
-  const existing = matches.find((tab) => isReadyServiceTab(tab, origin));
-  if (existing?.id) {
-    await patchServiceAuth(service, { tabId: existing.id, managedTab: false });
+  const existing = [rememberedTab, ...matches]
+    .filter((tab) => tab?.id && tab.url && new URL(tab.url).origin === origin)
+    .reduce((best, tab) => (!best || serviceTabRank(tab) < serviceTabRank(best) ? tab : best), null);
+  if (existing) {
+    if (existing.discarded) {
+      await chrome.tabs.reload(existing.id);
+      await waitForTabOrigin(existing.id, origin);
+    }
+    if (existing.id !== rememberedTabId) await patchServiceAuth(service, { tabId: existing.id, managedTab: false });
     return existing.id;
   }
 
-  const tab = await createServiceTab(serviceTabIdleUrl(origin));
-  await waitForTabComplete(tab.id);
+  const tab = await createServiceTab(origin);
+  await waitForTabOrigin(tab.id, origin);
   await patchServiceAuth(service, { tabId: tab.id, managedTab: true });
   return tab.id;
 }
 
-// A static same-origin text page finishes loading in background tabs and stays cheap enough to avoid freezing.
-function serviceTabIdleUrl(url) {
-  return `${new URL(url).origin}${SERVICE_TAB_IDLE_PATH}`;
-}
-
-function isReadyServiceTab(tab, origin) {
-  return Boolean(
-    tab?.id && tab.url && tab.status === "complete" && !tab.discarded && !tab.frozen
-      && new URL(tab.url).origin === origin
-  );
+// Prefer tabs that can run scripts right away; discarded or frozen tabs are the last resort.
+function serviceTabRank(tab) {
+  if (tab.discarded || tab.frozen) return 3;
+  if (tab.status === "complete") return 0;
+  return tab.active ? 1 : 2;
 }
 
 async function createServiceTab(url) {
@@ -938,16 +924,17 @@ function withTimeout(promise, timeoutMs, message) {
   ]).finally(() => clearTimeout(timeout));
 }
 
-async function waitForTabComplete(tabId) {
-  const current = await chrome.tabs.get(tabId);
-  if (current.status === "complete") return;
+// executeScript waits for the DOM itself, so only wait for the navigation to commit, not for "complete".
+async function waitForTabOrigin(tabId, origin) {
+  const isCommitted = (tab) => !tab.discarded && Boolean(tab.url) && new URL(tab.url).origin === origin;
+  if (isCommitted(await chrome.tabs.get(tabId))) return;
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("Hết thời gian chờ tab hệ thống tải xong."));
+      reject(new Error("Hết thời gian chờ tab hệ thống mở trang."));
     }, 15_000);
-    const listener = (updatedTabId, changeInfo) => {
-      if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
+    const listener = (updatedTabId, _changeInfo, tab) => {
+      if (updatedTabId !== tabId || !isCommitted(tab)) return;
       clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
       resolve();
