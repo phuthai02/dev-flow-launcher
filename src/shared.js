@@ -114,6 +114,68 @@ export function createActionGuard() {
   };
 }
 
+export const MERGE_FLOW = ["pre-develop", "develop", "uat", "prod"];
+
+export function nextMergeFlowBranch(branchName) {
+  const index = MERGE_FLOW.indexOf(branchName);
+  return index >= 0 ? MERGE_FLOW[index + 1] ?? null : null;
+}
+
+export function previousMergeFlowBranch(branchName) {
+  const index = MERGE_FLOW.indexOf(branchName);
+  return index > 0 ? MERGE_FLOW[index - 1] : null;
+}
+
+export function assertMergeFlow(sourceBranch, targetBranch) {
+  const sourceIndex = MERGE_FLOW.indexOf(sourceBranch);
+  const targetIndex = MERGE_FLOW.indexOf(targetBranch);
+  if (sourceIndex < 0 || targetIndex < 0 || targetIndex === sourceIndex + 1) return;
+  throw new Error(`Không được merge vượt cấp. Lộ trình: ${MERGE_FLOW.join(" → ")}.`);
+}
+
+const MERGE_STATUS_PENDING = new Set([
+  "unchecked",
+  "checking",
+  "preparing",
+  "approvals_syncing",
+  "cannot_be_merged_recheck",
+]);
+const MERGE_STATUS_LABELS = {
+  mergeable: "Sẵn sàng merge",
+  can_be_merged: "Sẵn sàng merge",
+  conflict: "Có conflict",
+  cannot_be_merged: "Không merge được",
+  need_rebase: "Cần rebase",
+  ci_must_pass: "Pipeline phải pass",
+  ci_still_running: "Pipeline đang chạy",
+  not_approved: "Chưa được approve",
+  requested_changes: "Có yêu cầu sửa",
+  discussions_not_resolved: "Còn thảo luận chưa resolve",
+  draft_status: "MR đang là draft",
+  not_open: "MR không còn mở",
+  merge_request_blocked: "Bị MR khác chặn",
+  status_checks_must_pass: "Status check chưa pass",
+  security_policy_violations: "Vi phạm security policy",
+};
+
+export function mergeRequestStatus(mergeRequest) {
+  const key = String(mergeRequest?.detailed_merge_status || mergeRequest?.merge_status || "unchecked");
+  if (MERGE_STATUS_PENDING.has(key)) {
+    return { key, pending: true, canMerge: false, tone: "checking", label: "GitLab đang kiểm tra…" };
+  }
+  if (key === "mergeable" || key === "can_be_merged") {
+    return { key, pending: false, canMerge: true, tone: "clear", label: MERGE_STATUS_LABELS[key] };
+  }
+  const hasConflicts = mergeRequest?.has_conflicts === true || key === "conflict";
+  return {
+    key,
+    pending: false,
+    canMerge: false,
+    tone: hasConflicts ? "conflict" : "blocked",
+    label: hasConflicts ? MERGE_STATUS_LABELS.conflict : MERGE_STATUS_LABELS[key] ?? key,
+  };
+}
+
 export function normalizeCommitResponse(response) {
   if (Array.isArray(response)) return response;
   return Array.isArray(response?.commits) ? response.commits : [];

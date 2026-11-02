@@ -2,11 +2,13 @@ import {
   AUTH_KEY,
   STORAGE_KEY,
   SYNC_KEY,
+  assertMergeFlow,
   assertSameOrigin,
   createActionGuard,
   encodeProjectId,
   flattenJenkinsJobs,
   isJenkinsAuthenticated,
+  mergeRequestStatus,
   normalizeBaseUrl,
   normalizeCommitResponse,
   parseBuildParameters,
@@ -15,17 +17,15 @@ import {
 } from "./shared.js";
 
 const LOGIN_PENDING_KEY = "devFlowLoginPending";
-const EXPLICIT_SERVICE_URLS_MIGRATION_KEY = "devFlowExplicitServiceUrlsRequired";
 const runActionOnce = createActionGuard();
 const serviceTabResolutions = new Map();
 const automaticLoginAttempts = new Map();
 const mergeRequestCommitCache = new Map();
 const AUTOMATIC_LOGIN_COOLDOWN_MS = 120_000;
+const MERGE_STATUS_POLL_MS = 1_500;
+const MERGE_STATUS_TIMEOUT_MS = 30_000;
 
-chrome.runtime.onInstalled.addListener(async (details) => {
-  await restrictStorageAccess();
-  await requireExplicitServiceUrls(details);
-});
+chrome.runtime.onInstalled.addListener(restrictStorageAccess);
 chrome.runtime.onStartup.addListener(restrictStorageAccess);
 
 async function restrictStorageAccess() {
@@ -33,40 +33,6 @@ async function restrictStorageAccess() {
     chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }),
     chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }),
   ]);
-}
-
-async function requireExplicitServiceUrls(details) {
-  const migration = await chrome.storage.local.get(EXPLICIT_SERVICE_URLS_MIGRATION_KEY);
-  if (migration[EXPLICIT_SERVICE_URLS_MIGRATION_KEY]) return;
-
-  if (details.reason === "update") {
-    const storedSettings = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
-    if (storedSettings) {
-      const previousOrigins = [storedSettings.gitlabLoginUrl, storedSettings.jenkinsLoginUrl]
-        .map((url) => {
-          try {
-            return url ? permissionPattern(url) : null;
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
-      await chrome.storage.local.set({
-        [STORAGE_KEY]: {
-          ...storedSettings,
-          gitlabLoginUrl: "",
-          jenkinsLoginUrl: "",
-        },
-        [AUTH_KEY]: {},
-      });
-      await chrome.storage.local.remove(SYNC_KEY);
-      if (previousOrigins.length) {
-        await chrome.permissions.remove({ origins: [...new Set(previousOrigins)] });
-      }
-    }
-  }
-
-  await chrome.storage.local.set({ [EXPLICIT_SERVICE_URLS_MIGRATION_KEY]: true });
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -125,6 +91,8 @@ async function handleMessage(message) {
       return getBranchComparison(message.projectId, message.sourceBranch, message.targetBranch);
     case "GET_MERGE_REQUESTS":
       return getMergeRequests(message.projectId);
+    case "GET_MERGE_REQUEST":
+      return getMergeRequest(message.projectId, message.mergeRequestIid);
     case "CREATE_MERGE_REQUEST":
       return createMergeRequest(message.payload);
     case "MERGE_MERGE_REQUEST":
@@ -647,7 +615,7 @@ async function gitlabRequest(path, options = {}) {
 async function getMergeRequests(projectId) {
   if (!projectId) throw new Error("Thiếu project để tải merge request.");
   const mergeRequests = await gitlabRequest(
-    `/api/v4/projects/${encodeProjectId(projectId)}/merge_requests?state=opened&order_by=updated_at&sort=desc&per_page=20`
+    `/api/v4/projects/${encodeProjectId(projectId)}/merge_requests?state=opened&order_by=updated_at&sort=desc&per_page=20&with_merge_status_recheck=true`
   );
   return mapWithConcurrency(mergeRequests, 4, async (mergeRequest) => {
     const cacheKey = `${projectId}:${mergeRequest.iid}`;
@@ -730,6 +698,7 @@ async function createMergeRequest(payload) {
   if (payload.sourceBranch === payload.targetBranch) {
     throw new Error("Source branch và target branch phải khác nhau.");
   }
+  assertMergeFlow(payload.sourceBranch, payload.targetBranch);
   const actionKey = `create-mr:${payload.projectId}:${payload.sourceBranch}:${payload.targetBranch}:${payload.title.trim()}`;
   return runActionOnce(actionKey, 3_000, "Merge request này vừa được gửi. Hãy chờ GitLab xử lý.", () =>
     gitlabRequest(`/api/v4/projects/${encodeProjectId(payload.projectId)}/merge_requests`, {
@@ -746,15 +715,37 @@ async function createMergeRequest(payload) {
   );
 }
 
+function mergeRequestPath(projectId, mergeRequestIid) {
+  return `/api/v4/projects/${encodeProjectId(projectId)}/merge_requests/${encodeURIComponent(String(mergeRequestIid))}`;
+}
+
+async function getMergeRequest(projectId, mergeRequestIid) {
+  if (!projectId || !mergeRequestIid) throw new Error("Thiếu merge request cần kiểm tra.");
+  return gitlabRequest(mergeRequestPath(projectId, mergeRequestIid));
+}
+
+async function waitForMergeStatus(projectId, mergeRequestIid) {
+  const deadline = Date.now() + MERGE_STATUS_TIMEOUT_MS;
+  let mergeRequest = await getMergeRequest(projectId, mergeRequestIid);
+  while (mergeRequestStatus(mergeRequest).pending && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, MERGE_STATUS_POLL_MS));
+    mergeRequest = await gitlabSessionRequest(mergeRequestPath(projectId, mergeRequestIid));
+  }
+  return mergeRequest;
+}
+
 async function mergeMergeRequest(projectId, mergeRequestIid) {
   if (!projectId || !mergeRequestIid) throw new Error("Thiếu merge request cần merge.");
   const actionKey = `merge-mr:${projectId}:${mergeRequestIid}`;
-  return runActionOnce(actionKey, 3_000, "Merge request này đang được merge.", () =>
-    gitlabRequest(
-      `/api/v4/projects/${encodeProjectId(projectId)}/merge_requests/${encodeURIComponent(String(mergeRequestIid))}/merge`,
-      { method: "PUT" }
-    )
-  );
+  return runActionOnce(actionKey, 3_000, "Merge request này đang được merge.", async () => {
+    const mergeRequest = await waitForMergeStatus(projectId, mergeRequestIid);
+    const status = mergeRequestStatus(mergeRequest);
+    if (!status.canMerge) throw new Error(`!${mergeRequestIid} chưa merge được: ${status.label}`);
+    return gitlabSessionRequest(`${mergeRequestPath(projectId, mergeRequestIid)}/merge`, {
+      method: "PUT",
+      body: JSON.stringify({ sha: mergeRequest.sha }),
+    });
+  });
 }
 
 async function closeMergeRequest(projectId, mergeRequestIid) {

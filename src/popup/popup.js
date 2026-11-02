@@ -3,8 +3,12 @@ import {
   STORAGE_KEY,
   SYNC_KEY,
   UI_STATE_KEY,
+  assertMergeFlow,
+  mergeRequestStatus,
+  nextMergeFlowBranch,
   normalizeBaseUrl,
   permissionPattern,
+  previousMergeFlowBranch,
   safeMessage,
   searchMatchScore,
   serviceBaseFromLoginUrl,
@@ -31,6 +35,9 @@ let projects = [];
 let branches = [];
 let jobs = [];
 let mergeRequests = [];
+let mergeStatusPollId = 0;
+const MERGE_STATUS_POLL_MS = 1_500;
+const MERGE_STATUS_MAX_POLLS = 20;
 let lastAutomaticMergeRequestTitle = "";
 let branchCompareRequestId = 0;
 let stageViewRequestId = 0;
@@ -42,6 +49,7 @@ let stageViewDom = null;
 let trackedBuild = null;
 let autoSyncInProgress = false;
 let lastPersistedUiState = {};
+let storedStateLoaded = false;
 let settingsWritePromise = Promise.resolve();
 const activeLoginServices = new Set();
 const searchSelectData = new Map();
@@ -77,6 +85,7 @@ jobSelect.addEventListener(SEARCH_SELECT_CHANGE_EVENT, updateSelectedJob);
 jobSelect.addEventListener("input", hideStageView);
 [sourceSelect, targetSelect].forEach((input) => {
   input.addEventListener(SEARCH_SELECT_CHANGE_EVENT, () => {
+    autoFillMergeFlowBranch(input);
     updateDefaultMergeRequestTitle();
     loadBranchComparison();
   });
@@ -106,6 +115,7 @@ window.addEventListener("pagehide", () => {
 });
 document.querySelector("#create-mr").addEventListener("click", createMergeRequest);
 document.querySelector("#trigger-build").addEventListener("click", triggerBuild);
+document.querySelector("#open-jenkins").addEventListener("click", openJenkins);
 document.querySelector("#test-connections").addEventListener("click", testConnections);
 document.querySelector("#login-gitlab").addEventListener("click", () => login("gitlab"));
 document.querySelector("#login-jenkins").addEventListener("click", () => login("jenkins"));
@@ -134,6 +144,7 @@ async function init() {
   const uiState = stored[UI_STATE_KEY];
   populateSettings(settings);
   restoreUiState(uiState);
+  storedStateLoaded = true;
   await Promise.all([refreshAuthStatus(), refreshLastSync()]);
 
   if (!settings?.gitlabLoginUrl && !settings?.jenkinsLoginUrl) {
@@ -175,6 +186,7 @@ async function loadBranches() {
   }
   setSearchLoading(sourceSelect, "Đang tải…");
   setSearchLoading(targetSelect, "Đang tải…");
+  stopMergeStatusPolling();
   renderMergeRequestMessage("Đang tải merge request…");
 
   try {
@@ -183,11 +195,10 @@ async function loadBranches() {
       sendMessage({ type: "GET_MERGE_REQUESTS", projectId: project.id }),
     ]);
     branches = branchResult;
-    mergeRequests = mergeRequestResult;
     fillSearchOptions(sourceSelect, sourceOptions, branches, (item) => item.name, "Chọn source");
     fillSearchOptions(targetSelect, targetOptions, branches, (item) => item.name, "Chọn target");
     updateDefaultMergeRequestTitle();
-    renderMergeRequests(mergeRequests);
+    showMergeRequests(project.id, mergeRequestResult);
   } catch (error) {
     clearBranches();
     clearMergeRequests("Không tải được merge request.");
@@ -216,6 +227,7 @@ async function createMergeRequest() {
       (item) => item.name,
       "Target branch không tồn tại. Hãy chọn branch trong danh sách."
     );
+    assertMergeFlow(sourceBranch.name, targetBranch.name);
     const mergeRequest = await sendMessage({
       type: "CREATE_MERGE_REQUEST",
       payload: {
@@ -234,17 +246,55 @@ async function createMergeRequest() {
 }
 
 async function loadMergeRequests(projectId) {
+  stopMergeStatusPolling();
   renderMergeRequestMessage("Đang tải merge request…");
   try {
-    mergeRequests = await sendMessage({ type: "GET_MERGE_REQUESTS", projectId });
-    renderMergeRequests(mergeRequests);
+    showMergeRequests(projectId, await sendMessage({ type: "GET_MERGE_REQUESTS", projectId }));
   } catch (error) {
     renderMergeRequestMessage("Không tải được merge request.", true);
     throw error;
   }
 }
 
+function showMergeRequests(projectId, items) {
+  mergeRequests = items;
+  renderMergeRequests(mergeRequests);
+  startMergeStatusPolling(projectId);
+}
+
+function startMergeStatusPolling(projectId) {
+  stopMergeStatusPolling();
+  const pollId = mergeStatusPollId;
+  let attempts = 0;
+
+  const poll = async () => {
+    if (pollId !== mergeStatusPollId) return;
+    const pending = mergeRequests.filter((item) => mergeRequestStatus(item).pending);
+    if (!pending.length || attempts >= MERGE_STATUS_MAX_POLLS) return;
+    attempts += 1;
+    try {
+      const updates = await Promise.all(pending.map((item) =>
+        sendMessage({ type: "GET_MERGE_REQUEST", projectId, mergeRequestIid: item.iid })
+      ));
+      if (pollId !== mergeStatusPollId) return;
+      const updatesByIid = new Map(updates.map((item) => [String(item.iid), item]));
+      mergeRequests = mergeRequests.map((item) => ({ ...item, ...updatesByIid.get(String(item.iid)) }));
+      renderMergeRequests(mergeRequests);
+    } catch {
+      // Lỗi tạm thời: giữ trạng thái cũ, lượt sau thử lại.
+    }
+    setTimeout(poll, MERGE_STATUS_POLL_MS);
+  };
+
+  setTimeout(poll, MERGE_STATUS_POLL_MS);
+}
+
+function stopMergeStatusPolling() {
+  mergeStatusPollId += 1;
+}
+
 function clearMergeRequests(message = "Chọn project để xem merge request.") {
+  stopMergeStatusPolling();
   mergeRequests = [];
   mergeRequestCount.textContent = "";
   renderMergeRequestMessage(message);
@@ -276,9 +326,9 @@ function renderMergeRequests(items) {
     title.className = "merge-request-title";
     title.textContent = `!${item.iid} ${item.title}`;
     const state = document.createElement("span");
-    const hasConflicts = item.has_conflicts === true || item.detailed_merge_status === "conflicts";
-    state.className = `merge-request-state ${hasConflicts ? "conflict" : "clear"}`;
-    state.textContent = hasConflicts ? "Có conflict" : "Không conflict";
+    const mergeStatus = mergeRequestStatus(item);
+    state.className = `merge-request-state ${mergeStatus.tone}`;
+    state.textContent = mergeStatus.label;
     top.append(title, state);
 
     const meta = document.createElement("div");
@@ -312,8 +362,11 @@ function renderMergeRequests(items) {
 
     const actions = document.createElement("div");
     actions.className = "merge-request-actions";
+    const mergeButton = mergeRequestActionButton("merge", "Merge", item.iid);
+    mergeButton.disabled = !mergeStatus.canMerge;
+    if (!mergeStatus.canMerge) mergeButton.title = mergeStatus.label;
     actions.append(
-      mergeRequestActionButton("merge", "Merge", item.iid),
+      mergeButton,
       mergeRequestActionButton("close", "Close", item.iid, "danger")
     );
     if (item.web_url) actions.append(mergeRequestActionButton("view", "Xem GitLab", item.iid, "secondary"));
@@ -533,7 +586,9 @@ function renderStageView(runs) {
     const runHeader = createStageCell("th", run.name || `#${run.id}`);
     const runStatus = document.createElement("span");
     runStatus.className = "stage-run-status";
-    runHeader.append(runStatus);
+    const runTime = document.createElement("span");
+    runTime.className = "stage-run-time";
+    runHeader.append(runStatus, runTime);
     row.append(runHeader);
 
     const cells = new Map();
@@ -542,7 +597,7 @@ function renderStageView(runs) {
       cells.set(name, cell);
       row.append(cell);
     }
-    runRows.set(pipelineRunKey(run), { status: runStatus, cells });
+    runRows.set(pipelineRunKey(run), { status: runStatus, time: runTime, cells });
     body.append(row);
   }
   table.append(body);
@@ -564,6 +619,8 @@ function updateStageViewDom(runs, stageNames) {
     const row = stageViewDom.runRows.get(pipelineRunKey(run));
     if (!row) continue;
     row.status.textContent = run.status || "UNKNOWN";
+    row.time.textContent = formatBuildTime(run.startTimeMillis);
+    row.time.title = `Thời gian chạy: ${formatDuration(run.durationMillis)}`;
     for (const name of stageNames) {
       const stage = (run.stages ?? []).find((item) => item.name === name);
       updateStageCell(row.cells.get(name), stage);
@@ -600,6 +657,11 @@ function average(values) {
   return numbers.length ? numbers.reduce((total, value) => total + value, 0) / numbers.length : 0;
 }
 
+function formatBuildTime(startTimeMillis) {
+  const start = Number(startTimeMillis);
+  return Number.isFinite(start) && start > 0 ? new Date(start).toLocaleString("vi-VN") : "";
+}
+
 function formatDuration(milliseconds) {
   const value = Math.max(0, Number(milliseconds) || 0);
   if (value < 1000) return `${Math.round(value)}ms`;
@@ -631,6 +693,23 @@ async function triggerBuild() {
   }, 3_000);
 }
 
+async function openJenkins() {
+  try {
+    const job = jobSelect.value.trim()
+      ? requireListedValue(
+        jobSelect,
+        jobs,
+        (item) => item.path,
+        "Jenkins job không tồn tại. Hãy chọn job trong danh sách."
+      )
+      : null;
+    const url = job?.url ?? serviceBaseFromLoginUrl(normalizeBaseUrl(value("jenkins-login-url")), "jenkins");
+    await chrome.tabs.create({ url });
+  } catch (error) {
+    showStatus(safeMessage(error), "error");
+  }
+}
+
 function populateSettings(settings) {
   setValue("gitlab-login-url", settings?.gitlabLoginUrl);
   setValue("gitlab-username", settings?.gitlabUsername);
@@ -658,6 +737,7 @@ function restoreUiState(uiState) {
 }
 
 function persistUiState() {
+  if (!storedStateLoaded) return;
   const project = findListedValue(projectSelect.value, projects, (item) => item.path_with_namespace);
   const job = findListedValue(jobSelect.value, jobs, (item) => item.path);
   const controls = {};
@@ -781,8 +861,7 @@ function applySyncResult(result, selection = {}) {
     loadBranchComparison();
   }
   if (Array.isArray(result.mergeRequests) && result.projectId) {
-    mergeRequests = result.mergeRequests;
-    renderMergeRequests(mergeRequests);
+    showMergeRequests(result.projectId, result.mergeRequests);
   }
   persistUiState();
 }
@@ -802,6 +881,7 @@ async function testConnections() {
 }
 
 function persistSettings() {
+  if (!storedStateLoaded) return settingsWritePromise;
   return enqueueSettingsWrite(readSettingsFromUi());
 }
 
@@ -1053,6 +1133,18 @@ function updateDefaultMergeRequestTitle() {
     mergeRequestTitle.value = nextTitle;
   }
   lastAutomaticMergeRequestTitle = nextTitle;
+}
+
+function autoFillMergeFlowBranch(changedInput) {
+  const isSource = changedInput === sourceSelect;
+  const changedBranch = findListedValue(changedInput.value, branches, (item) => item.name);
+  if (!changedBranch) return;
+  const counterpartName = isSource
+    ? nextMergeFlowBranch(changedBranch.name)
+    : previousMergeFlowBranch(changedBranch.name);
+  const counterpart = counterpartName && findListedValue(counterpartName, branches, (item) => item.name);
+  if (!counterpart) return;
+  (isSource ? targetSelect : sourceSelect).value = counterpart.name;
 }
 
 function selectedBranchPair() {
